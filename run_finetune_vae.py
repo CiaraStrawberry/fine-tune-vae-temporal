@@ -33,6 +33,8 @@ from stable_diffusion_jax import AutoencoderKL
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from vit_vqgan import StyleGANDiscriminator, StyleGANDiscriminatorConfig
+import ModifiedVAE
+
 
 import wandb
 
@@ -86,6 +88,7 @@ cost_disc = 0.005
 fx_path = Path.home() / "models/stable-diffusion-v1-4-jax"
 vae, vae_params = AutoencoderKL.from_pretrained(f"{fx_path}/vae", _do_init=False)
 # default to float 32, I don't care
+modified_vae = modify_vae_model(vae)
 
 # %%
 model = vae
@@ -126,14 +129,16 @@ class DecoderImageDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         example = self.hfds[idx]
-        # indices = example["indices"]
         path = example["path"]
+        second_image_path = example["second_image_path"]  # Get path to the second image
         if self.root is not None:
             path = os.path.join(self.root, path.lstrip("/"))
+            second_image_path = os.path.join(self.root, second_image_path.lstrip("/"))  # Do the same for the second image
         orig_arr = EncoderImageDataset.load(path)
+        second_image_arr = EncoderImageDataset.load(second_image_path)  # Load the second image
         return {
-            # "indices": indices,
             "original": orig_arr,
+            "additional": second_image_arr,  # Return the second image as part of the batch
             "name": Path(path).name,
         }
 
@@ -161,6 +166,17 @@ def try_batch_size(fn, start_batch_size=1):
         except Exception as e:
             return batch_size
 
+
+def modify_vae_model(vae_model):
+    # Create a new TemporalAutoEncoderKL instance
+    new_model = ModifiedVAE(config=vae_model.config, dtype=vae_model.dtype)
+
+    # Replace the parameters of the new model with the old one
+    new_model_params = {**vae_model.params}
+    
+    new_model = new_model.replace(params=new_model_params)
+
+    return new_model
 
 def get_param_counts(params):
     param_counts = [k.size for k in jax.tree_util.tree_leaves(params)]
@@ -255,10 +271,11 @@ state_disc = TrainState.create(
 loss_fn = optax.l2_loss
 
 #
-def reconstruct(params_with_encoder, params_with_decoder, original, train=False):
+def reconstruct(params_with_encoder, params_with_decoder, original, additional, train=False):
     distribution = vae.encode(original, params=params_with_encoder)
     latent = distribution.mode()
-    reconstruction = model.decode(latent, params_with_decoder, train=train)
+    # Pass the second image to the decoder
+    reconstruction = model.decode(latent, additional, params_with_decoder, train=train)
     return reconstruction
 
 
@@ -268,7 +285,10 @@ def train_step(state, batch, state_disc):
 
     def compute_loss(params, batch, dropout_rng, train=True):
         original = batch["original"]
-        reconstruction = reconstruct(original_params, params, original, train=train)
+        additional = batch["additional"]  # Extract the second image
+
+        # Pass the second image to the reconstruct function
+        reconstruction = reconstruct(original_params, params, original, additional, train=train)
         loss_l2 = loss_fn(reconstruction, original).mean()
         disc_fake_scores = state_disc.apply_fn(
             reconstruction,
@@ -496,7 +516,7 @@ def log_images(dl, num_images=8, suffix="", step=None):
 
         names = batch.pop("name")
         reconstruction = infer_fn(batch, state)
-        left_right = np.concatenate([batch["original"], reconstruction], axis=2)
+        left_right = np.concatenate([batch["original"],batch["additional"], reconstruction], axis=2)
 
         images = postpro(left_right)
         for name, image in zip(names, images):
@@ -522,13 +542,13 @@ def data_iter():
             yield batch
 
 
-# %%
 for steps, batch in zip(tqdm(range(total_steps)), data_iter()):
-    state, metrics, reconstruction = jit_train_step(state, batch, state_disc)
+    original_images = batch["original"]
+    additional_images = batch["additional"]
+    state, metrics, reconstruction = jit_train_step(state, (original_images, additional_images), state_disc)
     state_disc, metrics_disc = jit_train_step_disc(
-        state_disc, batch["original"], reconstruction
+        state_disc, original_images, reconstruction
     )
-    # metrics = metrics | metrics_disc
     metrics["disc_step"] = metrics_disc
     metrics["step"] = steps
     if steps % log_steps == 1:
