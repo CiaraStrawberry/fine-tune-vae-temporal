@@ -26,18 +26,21 @@ from flax import jax_utils
 from flax.jax_utils import pad_shard_unpad, unreplicate
 from flax.serialization import from_bytes, to_bytes
 from flax.training import train_state
+import flax.core
 from flax.training.common_utils import get_metrics, onehot, shard, shard_prng_key
 from lpips_j.lpips import LPIPS
 from PIL import Image
-from stable_diffusion_jax import AutoencoderKL
+from stable_diffusion_jax import AutoencoderKL,UNet2D,VAEConfig
 from torch.utils.data import DataLoader
+
 from tqdm import tqdm
 from vit_vqgan import StyleGANDiscriminator, StyleGANDiscriminatorConfig
-import ModifiedVAE
-
-
+from ModifiedVAE import TemporalAutoEncoderKL
+import json
+from stable_diffusion_jax.convert_diffusers_to_jax import convert_diffusers_to_jax
 import wandb
-
+import collections
+import random as rng
 # %%
 # since we don't fine-tune the encoder: we don't have kl loss
 kl_loss = False  # changin this have no effect
@@ -59,12 +62,87 @@ total_steps = 150_000 * gradient_accumulation_steps
 # skip disc loss for the first 1000 steps, because discriminator is not trained yet
 disc_loss_skip_steps = 1000 * gradient_accumulation_steps
 
+def deep_update(original, update):
+    """Deeply update a dictionary with the values from another dictionary."""
+    # If original is a FrozenDict, convert it to a regular dict first
+    if isinstance(original, flax.core.frozen_dict.FrozenDict):
+        original = dict(original)
+
+    updated = original.copy()
+    for key, value in update.items():
+        if isinstance(value, collections.abc.Mapping):
+            original_value = original.get(key, {})
+            if isinstance(original_value, collections.abc.Mapping):
+                updated[key] = deep_update(original_value, value)
+            else:
+                updated[key] = value
+        else:
+            updated[key] = value
+    return updated
+
+
+
+
+
+
+def clone_model_with_new_params(model, new_params):
+    # Create a new model with the same configuration and dtype
+    new_model = TemporalAutoEncoderKL(model.config, dtype=model.dtype)
+
+    # Now when you want to use the model, pass the new_params
+    # For instance, if you have some input data x
+    x = jnp.ones((1, 64, 64, 3), jnp.float32)  # replace with actual data
+
+    # Create a mock RNG key
+    rng = jax.random.PRNGKey(0)
+    
+    # Use the init_weights method to initialize the model and create its scope
+    initial_params = new_model.init_weights(rng, input_shape=x.shape)
+    
+    deep_update(initial_params, new_params)
+    new_model.params = initial_params
+
+
+    # Set the params of the new model to be the new_params
+    new_model.params = new_params
+
+    # Now we can apply the model with the new_params
+    output, _ = new_model(x)
+
+    return output
+
+
+def modify_vae_model(vae_model, vae_params):
+    # Create a new ModifiedVAE instance
+    # Replace the parameters of the new model with the old one
+    new_model_params = {**vae_params}
+    
+    new_model = clone_model_with_new_params(vae_model,new_model_params)
+
+    return new_model
+
+def get_missing_keys(params1, params2):
+    missing_keys = []
+
+    def helper(keys, dict1, dict2):
+        for key in dict1:
+            if key not in dict2:
+                missing_keys.append((*keys, key))
+            elif isinstance(dict1[key], dict) and isinstance(dict2[key], dict):
+                helper((*keys, key), dict1[key], dict2[key])
+
+    helper((), params1, params2)
+    return missing_keys
+
+
 # model = VQModel.from_pretrained("dalle-mini/vqgan_imagenet_f16_16384")
 data_root = "/disks"
 # a huggingface dataset containing columns "path" and optionally "indices"
 # path: can be absolute or relative to `data_root`
 # indices: VQ indices of the image at `path`
-hfds = HFDataset.from_json("danbooru_image_paths_ds.json")
+with open("image_paths.json", "r") as file:
+    hfds = json.load(file)
+
 
 # this corresponds to a local dir containing the config.json file
 # the config.json file is copied from https://github.com/patil-suraj/vit-vqgan/
@@ -85,10 +163,40 @@ cost_disc = 0.005
 # %%
 # convert the weight to jax first, see:
 # https://github.com/patil-suraj/stable-diffusion-jax/blob/47297f53bb4907f119079654310bfb14134c2714/example.py#L23
-fx_path = Path.home() / "models/stable-diffusion-v1-4-jax"
+
+###
+#USE THIS ONCE TO CONVERT DIFFUSERS TO JAX
+pt_path = "D:\\gitprojects\\finetuningvae\\fine-tune-models\\stable-diffusion-v1-5"
+fx_path = "D:\\gitprojects\\finetuningvae\\fine-tune-models\\stable-diffusion-v1-5-jax"
+dtype = None
+
+convert_diffusers_to_jax(pt_path, fx_path)
+###
+#fx_path = "D:\\gitprojects\\finetuningvae\\fine-tune-models\\stable-diffusion-v1-5"
+
+#unused test
+#unet, unet_params = UNet2D.from_pretrained(f"{fx_path}/unet", _do_init=False, dtype=dtype)
+
+
+
+
 vae, vae_params = AutoencoderKL.from_pretrained(f"{fx_path}/vae", _do_init=False)
 # default to float 32, I don't care
-modified_vae = modify_vae_model(vae)
+
+with open(f'{pt_path}/vae/config.json', 'r') as f:
+    config_dict = json.load(f)
+config = VAEConfig(**config_dict)
+new_model = AutoencoderKL(config)
+params = new_model.init_weights(jax.random.PRNGKey(0), jnp.ones((1, 64, 64, 3)))
+missing_keys = get_missing_keys(params, vae_params)
+for keys in missing_keys:
+    d = vae_params
+    for key in keys[:-1]:
+        d = d[key]
+    d[keys[-1]] = params[keys]
+
+modified_vae = modify_vae_model(vae, vae_params)  # use vae_params instead of d
+
 
 # %%
 model = vae
@@ -167,16 +275,7 @@ def try_batch_size(fn, start_batch_size=1):
             return batch_size
 
 
-def modify_vae_model(vae_model):
-    # Create a new TemporalAutoEncoderKL instance
-    new_model = ModifiedVAE(config=vae_model.config, dtype=vae_model.dtype)
 
-    # Replace the parameters of the new model with the old one
-    new_model_params = {**vae_model.params}
-    
-    new_model = new_model.replace(params=new_model_params)
-
-    return new_model
 
 def get_param_counts(params):
     param_counts = [k.size for k in jax.tree_util.tree_leaves(params)]
