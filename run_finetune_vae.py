@@ -30,17 +30,19 @@ import flax.core
 from flax.training.common_utils import get_metrics, onehot, shard, shard_prng_key
 from lpips_j.lpips import LPIPS
 from PIL import Image
-from stable_diffusion_jax import AutoencoderKL,UNet2D,VAEConfig
+from stable_diffusion_jax import UNet2D,VAEConfig,AutoencoderKL
+#from autoencoder_kl_old import AutoencoderKL
 from torch.utils.data import DataLoader
 
 from tqdm import tqdm
 from vit_vqgan import StyleGANDiscriminator, StyleGANDiscriminatorConfig
 from ModifiedVAE import TemporalAutoEncoderKL
 import json
-from stable_diffusion_jax.convert_diffusers_to_jax import convert_diffusers_to_jax
+#from stable_diffusion_jax.convert_diffusers_to_jax import convert_diffusers_to_jax
 import wandb
 import collections
 import random as rng
+from datasets import load_dataset
 # %%
 # since we don't fine-tune the encoder: we don't have kl loss
 kl_loss = False  # changin this have no effect
@@ -62,54 +64,6 @@ total_steps = 150_000 * gradient_accumulation_steps
 # skip disc loss for the first 1000 steps, because discriminator is not trained yet
 disc_loss_skip_steps = 1000 * gradient_accumulation_steps
 
-def deep_update(original, update):
-    """Deeply update a dictionary with the values from another dictionary."""
-    # If original is a FrozenDict, convert it to a regular dict first
-    if isinstance(original, flax.core.frozen_dict.FrozenDict):
-        original = dict(original)
-
-    updated = original.copy()
-    for key, value in update.items():
-        if isinstance(value, collections.abc.Mapping):
-            original_value = original.get(key, {})
-            if isinstance(original_value, collections.abc.Mapping):
-                updated[key] = deep_update(original_value, value)
-            else:
-                updated[key] = value
-        else:
-            updated[key] = value
-    return updated
-
-
-
-
-
-
-def clone_model_with_new_params(model, new_params):
-    # Create a new model with the same configuration and dtype
-    new_model = TemporalAutoEncoderKL(model.config, dtype=model.dtype)
-
-    # Now when you want to use the model, pass the new_params
-    # For instance, if you have some input data x
-    x = jnp.ones((1, 64, 64, 3), jnp.float32)  # replace with actual data
-
-    # Create a mock RNG key
-    rng = jax.random.PRNGKey(0)
-    
-    # Use the init_weights method to initialize the model and create its scope
-    initial_params = new_model.init_weights(rng, input_shape=x.shape)
-    
-    deep_update(initial_params, new_params)
-    new_model.params = initial_params
-
-
-    # Set the params of the new model to be the new_params
-    new_model.params = new_params
-
-    # Now we can apply the model with the new_params
-    output, _ = new_model(x)
-
-    return output
 
 
 def modify_vae_model(vae_model, vae_params):
@@ -117,9 +71,9 @@ def modify_vae_model(vae_model, vae_params):
     # Replace the parameters of the new model with the old one
     new_model_params = {**vae_params}
     
-    new_model = clone_model_with_new_params(vae_model,new_model_params)
+    #new_model = clone_model_with_new_params(vae_model,new_model_params)
 
-    return new_model
+    return vae_model
 
 def get_missing_keys(params1, params2):
     missing_keys = []
@@ -136,12 +90,14 @@ def get_missing_keys(params1, params2):
 
 
 # model = VQModel.from_pretrained("dalle-mini/vqgan_imagenet_f16_16384")
-data_root = "/disks"
+data_root = ""
 # a huggingface dataset containing columns "path" and optionally "indices"
 # path: can be absolute or relative to `data_root`
 # indices: VQ indices of the image at `path`
-with open("image_paths.json", "r") as file:
-    hfds = json.load(file)
+#with open("image_paths.json", "r") as file:
+#    hfds = json.load(file)
+
+hfds = load_dataset('json', data_files="flattened_image_paths.json")
 
 
 # this corresponds to a local dir containing the config.json file
@@ -170,7 +126,7 @@ pt_path = "D:\\gitprojects\\finetuningvae\\fine-tune-models\\stable-diffusion-v1
 fx_path = "D:\\gitprojects\\finetuningvae\\fine-tune-models\\stable-diffusion-v1-5-jax"
 dtype = None
 
-convert_diffusers_to_jax(pt_path, fx_path)
+#convert_diffusers_to_jax(pt_path, fx_path)
 ###
 #fx_path = "D:\\gitprojects\\finetuningvae\\fine-tune-models\\stable-diffusion-v1-5"
 
@@ -183,17 +139,6 @@ convert_diffusers_to_jax(pt_path, fx_path)
 vae, vae_params = AutoencoderKL.from_pretrained(f"{fx_path}/vae", _do_init=False)
 # default to float 32, I don't care
 
-with open(f'{pt_path}/vae/config.json', 'r') as f:
-    config_dict = json.load(f)
-config = VAEConfig(**config_dict)
-new_model = AutoencoderKL(config)
-params = new_model.init_weights(jax.random.PRNGKey(0), jnp.ones((1, 64, 64, 3)))
-missing_keys = get_missing_keys(params, vae_params)
-for keys in missing_keys:
-    d = vae_params
-    for key in keys[:-1]:
-        d = d[key]
-    d[keys[-1]] = params[keys]
 
 modified_vae = modify_vae_model(vae, vae_params)  # use vae_params instead of d
 
@@ -237,16 +182,16 @@ class DecoderImageDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         example = self.hfds[idx]
-        path = example["path"]
-        second_image_path = example["second_image_path"]  # Get path to the second image
+        path = example["image_path"]["path"]
+        second_image_path = example["image_path"]["second_image_path"]  # Get path to the second image
         if self.root is not None:
             path = os.path.join(self.root, path.lstrip("/"))
             second_image_path = os.path.join(self.root, second_image_path.lstrip("/"))  # Do the same for the second image
         orig_arr = EncoderImageDataset.load(path)
         second_image_arr = EncoderImageDataset.load(second_image_path)  # Load the second image
         return {
-            "original": orig_arr,
-            "additional": second_image_arr,  # Return the second image as part of the batch
+            "path": orig_arr,
+            "second_image_path": second_image_arr,  # Return the second image as part of the batch
             "name": Path(path).name,
         }
 
@@ -254,8 +199,8 @@ class DecoderImageDataset(torch.utils.data.Dataset):
     def collate_fn(examples, return_names=False):
         res = {
             # "indices": [example["indices"] for example in examples],
-            "original": np.concatenate(
-                [example["original"] for example in examples], axis=0
+            "path": np.concatenate(
+                [example["path"] for example in examples], axis=0
             ),
         }
         if return_names:
@@ -383,8 +328,8 @@ def train_step(state, batch, state_disc):
     dropout_rng, new_dropout_rng = jax.random.split(state.dropout_rng)
 
     def compute_loss(params, batch, dropout_rng, train=True):
-        original = batch["original"]
-        additional = batch["additional"]  # Extract the second image
+        original = batch["path"]
+        additional = batch["second_image_path"]  # Extract the second image
 
         # Pass the second image to the reconstruct function
         reconstruction = reconstruct(original_params, params, original, additional, train=train)
@@ -489,8 +434,8 @@ def train_step_disc(state_disc, batch, fake_images):
 
 # %%
 # Take the first 100 images as validation set
-train_ds = DecoderImageDataset(hfds.select(range(100, len(hfds))), root=data_root)
-test_ds = DecoderImageDataset(hfds.select(range(100)), root=data_root)
+train_ds = DecoderImageDataset(hfds['train'].select(range(100, len(hfds['train']))), root=data_root)
+test_ds = DecoderImageDataset(hfds['train'].select(range(100)), root=data_root)
 # %%
 jit_train_step = jax.jit(train_step)
 jit_train_step_disc = jax.jit(train_step_disc)
@@ -615,7 +560,7 @@ def log_images(dl, num_images=8, suffix="", step=None):
 
         names = batch.pop("name")
         reconstruction = infer_fn(batch, state)
-        left_right = np.concatenate([batch["original"],batch["additional"], reconstruction], axis=2)
+        left_right = np.concatenate([batch["path"],batch["second_image_path"], reconstruction], axis=2)
 
         images = postpro(left_right)
         for name, image in zip(names, images):
@@ -642,8 +587,8 @@ def data_iter():
 
 
 for steps, batch in zip(tqdm(range(total_steps)), data_iter()):
-    original_images = batch["original"]
-    additional_images = batch["additional"]
+    original_images = batch["path"]
+    additional_images = batch["second_image_path"]
     state, metrics, reconstruction = jit_train_step(state, (original_images, additional_images), state_disc)
     state_disc, metrics_disc = jit_train_step_disc(
         state_disc, original_images, reconstruction
